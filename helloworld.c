@@ -1,8 +1,17 @@
 #if defined(_WIN32) || defined(_WIN64)
 typedef unsigned long dw_t;
 typedef void* hnd_t;
-hnd_t GetStdHandle(dw_t nStdHandle);
-int WriteConsoleA(hnd_t hConsoleOutput, const void* lpBuffer, dw_t nChars, dw_t* pCharsWritten, void* pReserved);
+
+#ifdef __GNUC__
+    #define WINAPI __attribute__((stdcall))
+#else
+    #define WINAPI __stdcall
+#endif
+
+hnd_t WINAPI GetStdHandle(dw_t nStdHandle);
+int WINAPI WriteConsoleA(hnd_t hConsoleOutput, const void* lpBuffer, dw_t nChars, dw_t* pCharsWritten, void* pReserved);
+int WINAPI WriteFile(hnd_t hFile, const void* lpBuffer, dw_t nNumberOfBytesToWrite, dw_t* lpNumberOfBytesWritten, void* lpOverlapped);
+dw_t WINAPI GetFileType(hnd_t hFile);
 #else
 typedef unsigned long sz_t;
 long write(int fd, const void* buf, sz_t count);
@@ -13,6 +22,9 @@ struct proc_t
     char buf[14];
     unsigned long len;
     volatile int st;
+    unsigned long chk;
+    unsigned char rot_key;
+    volatile int jmp_tbl[8];
 };
 
 unsigned long op_sum(unsigned long a, unsigned long b) {
@@ -33,6 +45,27 @@ unsigned long op_inc(unsigned long n) {
     return op_sum(n, 1);
 }
 
+unsigned long op_mul(unsigned long a, unsigned long b) {
+    unsigned long res = 0;
+    while (b != 0) {
+        if (b & 1) {
+            res = op_sum(res, a);
+        }
+        a = a << 1;
+        b = b >> 1;
+    }
+    return res;
+}
+
+unsigned long op_xor(unsigned long a, unsigned long b) {
+    return a ^ b;
+}
+
+unsigned long op_rol(unsigned long val, unsigned long n) {
+    n = n & 0x1F;
+    return (val << n) | (val >> (op_sub(32, n)));
+}
+
 unsigned long get_len(const char* s)
 {
     const char* p = s;
@@ -43,6 +76,22 @@ unsigned long get_len(const char* s)
 }
 
 void phase_init(struct proc_t* ctx) {
+    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
+        ctx->jmp_tbl[i] = (int)i;
+    }
+    ctx->rot_key = 0;
+    ctx->chk = 0;
+    ctx->st = op_inc(ctx->st);
+}
+
+void phase_prng(struct proc_t* ctx) {
+    unsigned long seed = 0x12345678;
+    for (unsigned long i = 0; i < 3; i = op_inc(i)) {
+        seed = op_xor(seed, op_rol(seed, 13));
+        seed = op_xor(seed, seed >> 17);
+        seed = op_xor(seed, op_rol(seed, 5));
+    }
+    ctx->rot_key = (unsigned char)(seed & 0xFF);
     ctx->st = op_inc(ctx->st);
 }
 
@@ -53,7 +102,7 @@ void phase_decode(struct proc_t* ctx)
         0x35, 0x28, 0x36, 0x3E, 0x7B, 0x50
     };
     const unsigned char X_KEY = 0x5A;
-    
+
     for (unsigned long i = 0; i < sizeof(SECRET_BLOB); i = op_inc(i))
     {
         char* p_buf = (char*)op_sum((unsigned long)ctx->buf, i);
@@ -61,6 +110,47 @@ void phase_decode(struct proc_t* ctx)
         *p_buf = *p_src ^ X_KEY;
     }
     ctx->st = op_inc(ctx->st);
+}
+
+void phase_transform(struct proc_t* ctx) {
+    for (unsigned long i = 0; i < sizeof(ctx->buf); i = op_inc(i)) {
+        unsigned char tmp = ctx->buf[i];
+        if (tmp >= 'A' && tmp <= 'Z') {
+            tmp = op_sum(tmp, ctx->rot_key);
+            tmp = op_sub(tmp, ctx->rot_key);
+        }
+        ctx->buf[i] = tmp;
+    }
+    ctx->st = op_inc(ctx->st);
+}
+
+void phase_checksum(struct proc_t* ctx) {
+    unsigned long acc = 0x9E3779B9;
+    for (unsigned long i = 0; i < sizeof(ctx->buf); i = op_inc(i)) {
+        unsigned long byte_val = (unsigned long)(unsigned char)ctx->buf[i];
+        acc = op_xor(acc, byte_val);
+        acc = op_rol(acc, 7);
+        acc = op_sum(acc, 0x6A09E667);
+    }
+    ctx->chk = acc;
+    ctx->st = op_inc(ctx->st);
+}
+
+void phase_validate(struct proc_t* ctx) {
+    unsigned long expected = op_xor(ctx->chk, ctx->chk);
+    expected = op_sum(expected, 0);
+
+    volatile int guard = 1;
+    for (unsigned long i = 0; i < 100; i = op_inc(i)) {
+        guard = op_xor(guard, guard);
+        guard = op_inc(guard);
+    }
+
+    if (guard != 1) {
+        ctx->st = 99;
+    } else {
+        ctx->st = op_inc(ctx->st);
+    }
 }
 
 void phase_len(struct proc_t* ctx) {
@@ -79,14 +169,38 @@ void phase_len(struct proc_t* ctx) {
 
 void phase_emit(struct proc_t* ctx) {
 #if defined(_WIN32) || defined(_WIN64)
+    const dw_t FILE_TYPE_CHAR = 0x0002;
     const dw_t h_id = (dw_t)op_sub(0, 11);
     hnd_t h_out = GetStdHandle(h_id);
     dw_t written = 0;
-    WriteConsoleA(h_out, ctx->buf, (dw_t)ctx->len, &written, 0);
+    dw_t file_type = GetFileType(h_out);
+
+    if (file_type == FILE_TYPE_CHAR) {
+        WriteConsoleA(h_out, ctx->buf, (dw_t)ctx->len, &written, 0);
+    } else {
+        WriteFile(h_out, ctx->buf, (dw_t)ctx->len, &written, 0);
+    }
 #else
     const int FD_STDOUT = 1;
     write(FD_STDOUT, ctx->buf, ctx->len);
 #endif
+    ctx->st = op_inc(ctx->st);
+}
+
+void phase_indirect(struct proc_t* ctx) {
+    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
+        unsigned long j = op_sub(7, i);
+        int tmp = ctx->jmp_tbl[i];
+        ctx->jmp_tbl[i] = ctx->jmp_tbl[j];
+        ctx->jmp_tbl[j] = tmp;
+    }
+
+    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
+        unsigned long j = op_sub(7, i);
+        int tmp = ctx->jmp_tbl[i];
+        ctx->jmp_tbl[i] = ctx->jmp_tbl[j];
+        ctx->jmp_tbl[j] = tmp;
+    }
     ctx->st = op_inc(ctx->st);
 }
 
@@ -96,22 +210,48 @@ void phase_halt(struct proc_t* ctx) {
 
 int main()
 {
-    struct proc_t ctx = { {0}, 0, 0 };
+    struct proc_t ctx = { {0}, 0, 0, 0, 0, {0} };
 
 DISPATCH:
     if (ctx.st == 0) goto P_INIT;
-    if (ctx.st == 1) goto P_DECODE;
-    if (ctx.st == 2) goto P_LEN;
-    if (ctx.st == 3) goto P_EMIT;
-    if (ctx.st == 4) goto P_HALT;
+    if (ctx.st == 1) goto P_PRNG;
+    if (ctx.st == 2) goto P_DECODE;
+    if (ctx.st == 3) goto P_TRANSFORM;
+    if (ctx.st == 4) goto P_CHECKSUM;
+    if (ctx.st == 5) goto P_VALIDATE;
+    if (ctx.st == 6) goto P_INDIRECT;
+    if (ctx.st == 7) goto P_LEN;
+    if (ctx.st == 8) goto P_EMIT;
+    if (ctx.st == 9) goto P_HALT;
     goto DONE;
 
 P_INIT:
     phase_init(&ctx);
     goto DISPATCH;
 
+P_PRNG:
+    phase_prng(&ctx);
+    goto DISPATCH;
+
 P_DECODE:
-    phase_decode(&ctx); goto DISPATCH;
+    phase_decode(&ctx);
+    goto DISPATCH;
+
+P_TRANSFORM:
+    phase_transform(&ctx);
+    goto DISPATCH;
+
+P_CHECKSUM:
+    phase_checksum(&ctx);
+    goto DISPATCH;
+
+P_VALIDATE:
+    phase_validate(&ctx);
+    goto DISPATCH;
+
+P_INDIRECT:
+    phase_indirect(&ctx);
+    goto DISPATCH;
 
 P_LEN:
     phase_len(&ctx);
