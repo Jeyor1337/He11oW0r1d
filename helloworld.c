@@ -1,6 +1,7 @@
 #if defined(_WIN32) || defined(_WIN64)
 typedef unsigned long dw_t;
 typedef void* hnd_t;
+typedef unsigned long sz_t;
 
 #ifdef __GNUC__
     #define WINAPI __attribute__((stdcall))
@@ -74,6 +75,96 @@ unsigned long get_len(const char* s)
     }
     return op_sub((unsigned long)p, (unsigned long)s);
 }
+
+#define HEAP_SIZE 4096
+static char g_heap[HEAP_SIZE];
+static void* g_heap_base = 0;
+
+struct mem_block {
+    sz_t size;
+    int is_free;
+    struct mem_block* next;
+};
+
+void my_memcpy(void* dest, const void* src, sz_t n) {
+    char* d = (char*)dest;
+    const char* s = (const char*)src;
+    sz_t i = 0;
+    while (i < n) {
+        *d = *s;
+        d = (char*)op_inc((unsigned long)d);
+        s = (const char*)op_inc((unsigned long)s);
+        i = op_inc(i);
+    }
+}
+
+void init_heap() {
+    g_heap_base = (void*)g_heap;
+    struct mem_block* head = (struct mem_block*)g_heap_base;
+    head->size = op_sub(HEAP_SIZE, sizeof(struct mem_block));
+    head->is_free = 1;
+    head->next = 0;
+}
+
+void* my_malloc(sz_t size) {
+    if (g_heap_base == 0) {
+        init_heap();
+    }
+
+    sz_t remainder = size % sizeof(long);
+    if (remainder != 0) {
+        size = op_sum(size, op_sub(sizeof(long), remainder));
+    }
+
+    struct mem_block* current = (struct mem_block*)g_heap_base;
+    void* result = 0;
+
+    while (current != 0) {
+        if (current->is_free && current->size >= size) {
+            sz_t remaining_size = op_sub(current->size, size);
+            if (remaining_size > sizeof(struct mem_block)) {
+                struct mem_block* new_block = (struct mem_block*)op_sum((unsigned long)current, op_sum(sizeof(struct mem_block), size));
+                new_block->size = op_sub(remaining_size, sizeof(struct mem_block));
+                new_block->is_free = 1;
+                new_block->next = current->next;
+
+                current->size = size;
+                current->next = new_block;
+            }
+            
+            current->is_free = 0;
+            result = (void*)op_sum((unsigned long)current, sizeof(struct mem_block));
+            break;
+        }
+        current = current->next;
+    }
+
+    return result;
+}
+
+void my_free(void* ptr) {
+    if (ptr == 0) {
+        return;
+    }
+
+    struct mem_block* block_header = (struct mem_block*)op_sub((unsigned long)ptr, sizeof(struct mem_block));
+    block_header->is_free = 1;
+
+    struct mem_block* current = (struct mem_block*)g_heap_base;
+    while (current && current->next) {
+        if (current->is_free && current->next->is_free) {
+            if ((unsigned long)current->next == op_sum(op_sum((unsigned long)current, sizeof(struct mem_block)), current->size)) {
+                current->size = op_sum(current->size, op_sum(sizeof(struct mem_block), current->next->size));
+                current->next = current->next->next;
+            } else {
+                current = current->next;
+            }
+        } else {
+            current = current->next;
+        }
+    }
+}
+
 
 void phase_init(struct proc_t* ctx) {
     for (unsigned long i = 0; i < 8; i = op_inc(i)) {
@@ -167,6 +258,23 @@ void phase_len(struct proc_t* ctx) {
     ctx->st = op_inc(ctx->st);
 }
 
+void phase_indirect(struct proc_t* ctx) {
+    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
+        unsigned long j = op_sub(7, i);
+        int tmp = ctx->jmp_tbl[i];
+        ctx->jmp_tbl[i] = ctx->jmp_tbl[j];
+        ctx->jmp_tbl[j] = tmp;
+    }
+
+    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
+        unsigned long j = op_sub(7, i);
+        int tmp = ctx->jmp_tbl[i];
+        ctx->jmp_tbl[i] = ctx->jmp_tbl[j];
+        ctx->jmp_tbl[j] = tmp;
+    }
+    ctx->st = op_inc(ctx->st);
+}
+
 void phase_emit(struct proc_t* ctx) {
 #if defined(_WIN32) || defined(_WIN64)
     const dw_t FILE_TYPE_CHAR = 0x0002;
@@ -184,23 +292,6 @@ void phase_emit(struct proc_t* ctx) {
     const int FD_STDOUT = 1;
     write(FD_STDOUT, ctx->buf, ctx->len);
 #endif
-    ctx->st = op_inc(ctx->st);
-}
-
-void phase_indirect(struct proc_t* ctx) {
-    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
-        unsigned long j = op_sub(7, i);
-        int tmp = ctx->jmp_tbl[i];
-        ctx->jmp_tbl[i] = ctx->jmp_tbl[j];
-        ctx->jmp_tbl[j] = tmp;
-    }
-
-    for (unsigned long i = 0; i < 8; i = op_inc(i)) {
-        unsigned long j = op_sub(7, i);
-        int tmp = ctx->jmp_tbl[i];
-        ctx->jmp_tbl[i] = ctx->jmp_tbl[j];
-        ctx->jmp_tbl[j] = tmp;
-    }
     ctx->st = op_inc(ctx->st);
 }
 
